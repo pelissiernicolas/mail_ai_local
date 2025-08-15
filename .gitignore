@@ -18,6 +18,7 @@ mail.db
 All-mail*.mbox
 *.mbox
 mails.csv
+*.csv
 
 # OS
 .DS_Store
