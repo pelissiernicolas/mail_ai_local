@@ -2,28 +2,14 @@
 """
 mail_ai_local.py — Local email analysis toolkit (privacy-first)
 
-Features
-- Ingest Gmail Takeout MBOX into SQLite
-- Compute quick stats: top senders, counts per month/year, size, attachments
-- Optional local LLM (via Ollama) to summarize emails + suggest labels
-  * Requires Ollama running locally (http://localhost:11434) and a model like
-    mistral, llama3.1, qwen2.5, etc.
-
-Usage
-  # 1) Ingest MBOX into SQLite
-  python mail_ai_local.py ingest --mbox "/path/to/All mail Including Spam and Trash.mbox" --db ./mail.db
-
-  # 2) Show stats
-  python mail_ai_local.py stats --db ./mail.db
-  python mail_ai_local.py top-senders --db ./mail.db --limit 30
-  python mail_ai_local.py timeline --db ./mail.db --by month
-
-  # 3) Summarize + auto-label (local LLM via Ollama, optional)
-  python mail_ai_local.py summarize --db ./mail.db --model mistral --limit 200
-
-  # 4) Export CSV for analysis in Excel
-  python mail_ai_local.py export --db ./mail.db --out mails.csv
+Patched verbose edition:
+- Safer header parsing using get_content_disposition()
+- Idempotent ingest (UNIQUE on msg_id + INSERT OR IGNORE)
+- Deprecation fix for utcfromtimestamp (use timezone-aware fromtimestamp)
+- Ollama client: larger timeout + retries + warm-up
+- Verbose progress logs during summarize (id, from, subject, ETA)
 """
+
 import argparse
 import os
 import sqlite3
@@ -35,13 +21,15 @@ import json
 import datetime
 import requests
 import csv
+import time
 from pathlib import Path
+
+# ----------------- helpers -----------------
 
 def safe_decode(value):
     if value is None:
         return ""
     try:
-        # decode encoded headers like =?utf-8?Q?...
         if isinstance(value, bytes):
             value = value.decode('utf-8', errors='replace')
         decoded = str(make_header(decode_header(value)))
@@ -53,14 +41,13 @@ def safe_decode(value):
             return str(value)
 
 def extract_text_from_message(msg):
-    """Return plain text content; prefer text/plain, fallback to text/html stripped."""
+    """Return plain text content; prefer text/plain, fallback to stripped text/html."""
     if msg.is_multipart():
         parts = []
         for part in msg.walk():
             ctype = part.get_content_type()
-            dispo = (part.get_content_disposition() or '').lower()
-            if ctype == 'text/plain' and 'attachment' not in dispo:
-                # robustly handle cases where get_payload(decode=True) returns None
+            dispo = (part.get_content_disposition() or '').lower()  # safe
+            if ctype == 'text/plain' and dispo != 'attachment':
                 payload = part.get_payload(decode=True)
                 if payload is None:
                     continue
@@ -71,10 +58,10 @@ def extract_text_from_message(msg):
                 parts.append(text)
         if parts:
             return "\n".join(parts)
-        # fallback to first text/html part
+
+        # Fallback: first HTML part -> strip tags
         for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype == 'text/html':
+            if part.get_content_type() == 'text/html':
                 payload = part.get_payload(decode=True)
                 if payload is None:
                     continue
@@ -82,7 +69,6 @@ def extract_text_from_message(msg):
                     html = payload.decode(part.get_content_charset() or 'utf-8', errors='replace')
                 except Exception:
                     html = payload.decode('utf-8', errors='replace')
-                # naive html to text
                 return re.sub(r'<[^>]+>', ' ', html)
         return ""
     else:
@@ -102,7 +88,7 @@ def has_attachments(msg):
     if not msg.is_multipart():
         return False
     for part in msg.walk():
-        dispo = (part.get_content_disposition() or '').lower()
+        dispo = (part.get_content_disposition() or '').lower()  # safe
         if dispo == 'attachment':
             return True
     return False
@@ -128,6 +114,8 @@ def init_db(conn):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON emails(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_from ON emails(from_addr)")
+    # UNIQUE on msg_id to avoid duplicates on repeated ingest
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgid ON emails(msg_id)")
 
 def parse_date(dval):
     if not dval:
@@ -161,7 +149,8 @@ def ingest_mbox(mbox_path, db_path):
         attach = 1 if has_attachments(msg) else 0
 
         cur.execute("""
-            INSERT INTO emails (msg_id, from_addr, to_addr, cc_addr, bcc_addr, subject, date, ts, size_bytes, has_attachments, body, summary, auto_labels)
+            INSERT OR IGNORE INTO emails
+            (msg_id, from_addr, to_addr, cc_addr, bcc_addr, subject, date, ts, size_bytes, has_attachments, body, summary, auto_labels)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
         """, (msg_id, from_addr, to_addr, cc_addr, bcc_addr, subject, date_str, ts, size_bytes, attach, body))
         inserted += 1
@@ -182,7 +171,7 @@ def stats(db_path):
     last_ts = cur.execute("SELECT MAX(ts) FROM emails").fetchone()[0]
     def ts_to_date(ts):
         if ts is None: return None
-        return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+        return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d")
     print(f"Total emails: {total}")
     print(f"Total text size: {size/1024/1024:.2f} MB")
     print(f"With attachments: {attach}")
@@ -241,16 +230,30 @@ def export_csv(db_path, out_path):
     conn.close()
     print(f"Exported to {out_path}")
 
+# --------------- Ollama client ---------------
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
-def run_ollama(model, prompt, options=None):
+def run_ollama(model, prompt, options=None, timeout=600):
+    """Call Ollama with retries and larger timeout (first call loads model)."""
     payload = {"model": model, "prompt": prompt, "stream": False}
     if options:
         payload["options"] = options
-    r = requests.post(OLLAMA_URL, json=payload, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("response","").strip()
+
+    tries = 3
+    delay = 5
+    last_exc = None
+    for _ in range(tries):
+        try:
+            r = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("response","").strip()
+        except Exception as e:
+            last_exc = e
+            time.sleep(delay)
+            delay *= 2  # exponential backoff
+    raise last_exc
 
 SUMMARY_PROMPT = """Tu es une IA qui résume des e-mails en français et propose des étiquettes de tri.
 Voici l'e-mail (texte brut):
@@ -271,15 +274,28 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     rows = cur.execute("""
-        SELECT id, body FROM emails
+        SELECT id, body, from_addr, subject
+        FROM emails
         WHERE (summary IS NULL OR summary = '')
-        AND length(body) >= ?
+          AND length(body) >= ?
         ORDER BY ts DESC
         LIMIT ?
     """, (min_chars, limit)).fetchall()
-    print(f"To summarize: {len(rows)} emails")
+
+    total_to_do = len(rows)
+    print(f"To summarize: {total_to_do} emails")
+
+    # Warm-up: force model load once
+    try:
+        _ = run_ollama(model, "Réponds simplement: OK", options={"temperature": 0})
+    except Exception as e:
+        print(f"[WARN] warm-up failed: {e}")
+
     updated = 0
-    for _id, body in rows:
+    start_time = time.time()
+
+    for idx, (_id, body, from_addr, subject) in enumerate(rows, 1):
+        print(f"\n[{idx}/{total_to_do}] Traitement mail ID={_id} | From: {from_addr} | Sujet: {subject[:60]!r}")
         body_clip = body[:4000]  # keep prompt small
         prompt = SUMMARY_PROMPT.format(body=body_clip)
         try:
@@ -289,7 +305,6 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
             try:
                 parsed = json.loads(resp)
             except Exception:
-                # best-effort JSON extraction
                 m = re.search(r'\{.*\}', resp, flags=re.S)
                 if m:
                     try:
@@ -298,26 +313,38 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
                         parsed = {"summary": resp.strip(), "labels": [], "action_needed": False, "action": ""}
                 else:
                     parsed = {"summary": resp.strip(), "labels": [], "action_needed": False, "action": ""}
+
             summary = parsed.get("summary","")[:1000]
             labels = parsed.get("labels",[])
             if isinstance(labels, list):
                 labels_str = ", ".join(labels[:5])
             else:
                 labels_str = str(labels)[:200]
+
+            print(f"  ➜ Labels: {labels_str}")
+            print(f"  ➜ Résumé: {summary[:80]}...")
+
             if not dry:
                 cur.execute("UPDATE emails SET summary=?, auto_labels=? WHERE id=?", (summary, labels_str, _id))
                 updated += 1
                 if updated % 20 == 0:
                     conn.commit()
-                    print(f"Updated {updated} summaries...")
+                    elapsed = time.time() - start_time
+                    avg_per = max(elapsed / updated, 1e-6)
+                    remaining = (total_to_do - idx) * avg_per
+                    print(f"  ➜ Progression: {updated}/{total_to_do} | Temps estimé restant: {remaining/60:.1f} min")
+
         except Exception as e:
             print(f"[WARN] id={_id}: {e}")
+
     conn.commit()
     conn.close()
-    print(f"Done. Updated {updated} emails.")
+    print(f"\nDone. Updated {updated} emails.")
+
+# ----------------- CLI -----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Local Email AI Toolkit")
+    ap = argparse.ArgumentParser(description="Local Email AI Toolkit (verbose patched)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_ing = sub.add_parser("ingest", help="Ingest MBOX into SQLite")
