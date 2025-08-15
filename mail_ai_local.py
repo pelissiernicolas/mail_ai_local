@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-mail_ai_local.py — Local email analysis toolkit (privacy-first)
+mail_ai_local_verbose2.py — Local email analysis toolkit (privacy-first)
 
-Patched verbose edition:
-- Safer header parsing using get_content_disposition()
-- Idempotent ingest (UNIQUE on msg_id + INSERT OR IGNORE)
-- Deprecation fix for utcfromtimestamp (use timezone-aware fromtimestamp)
-- Ollama client: larger timeout + retries + warm-up
-- Verbose progress logs during summarize (id, from, subject, ETA)
+Adds:
+- Verbose progress + ETA
+- Safer parsing (get_content_disposition)
+- Idempotent ingest (UNIQUE msg_id + INSERT OR IGNORE)
+- Deprecation fix for utcfromtimestamp
+- Ollama client with retries + warm-up
+- Tunables for speed/quality: --clip, --num-predict, --num-ctx, --temp
+- Optional per-mail output file: --out-jsonl (JSON Lines)
 """
 
 import argparse
@@ -24,8 +26,6 @@ import csv
 import time
 from pathlib import Path
 
-# ----------------- helpers -----------------
-
 def safe_decode(value):
     if value is None:
         return ""
@@ -41,12 +41,11 @@ def safe_decode(value):
             return str(value)
 
 def extract_text_from_message(msg):
-    """Return plain text content; prefer text/plain, fallback to stripped text/html."""
     if msg.is_multipart():
         parts = []
         for part in msg.walk():
             ctype = part.get_content_type()
-            dispo = (part.get_content_disposition() or '').lower()  # safe
+            dispo = (part.get_content_disposition() or '').lower()
             if ctype == 'text/plain' and dispo != 'attachment':
                 payload = part.get_payload(decode=True)
                 if payload is None:
@@ -58,8 +57,6 @@ def extract_text_from_message(msg):
                 parts.append(text)
         if parts:
             return "\n".join(parts)
-
-        # Fallback: first HTML part -> strip tags
         for part in msg.walk():
             if part.get_content_type() == 'text/html':
                 payload = part.get_payload(decode=True)
@@ -88,7 +85,7 @@ def has_attachments(msg):
     if not msg.is_multipart():
         return False
     for part in msg.walk():
-        dispo = (part.get_content_disposition() or '').lower()  # safe
+        dispo = (part.get_content_disposition() or '').lower()
         if dispo == 'attachment':
             return True
     return False
@@ -114,7 +111,6 @@ def init_db(conn):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON emails(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_from ON emails(from_addr)")
-    # UNIQUE on msg_id to avoid duplicates on repeated ingest
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msgid ON emails(msg_id)")
 
 def parse_date(dval):
@@ -230,12 +226,11 @@ def export_csv(db_path, out_path):
     conn.close()
     print(f"Exported to {out_path}")
 
-# --------------- Ollama client ---------------
+# ---------- Ollama client (tunable) ----------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 def run_ollama(model, prompt, options=None, timeout=600):
-    """Call Ollama with retries and larger timeout (first call loads model)."""
     payload = {"model": model, "prompt": prompt, "stream": False}
     if options:
         payload["options"] = options
@@ -252,7 +247,7 @@ def run_ollama(model, prompt, options=None, timeout=600):
         except Exception as e:
             last_exc = e
             time.sleep(delay)
-            delay *= 2  # exponential backoff
+            delay *= 2
     raise last_exc
 
 SUMMARY_PROMPT = """Tu es une IA qui résume des e-mails en français et propose des étiquettes de tri.
@@ -263,14 +258,15 @@ Voici l'e-mail (texte brut):
 ---
 
 Objectif:
-1) Résume en 1-2 phrases.
-2) Propose 1 à 3 labels parmi: [Factures, Bancaire, Santé, Travail, École, RH, Rendez-vous, Technique, Newsletter, Promotions, Réseaux sociaux, Voyage, Livraison, Garanties, Notifications, Perso].
-3) Indique si action nécessaire (oui/non) et une action courte.
+1) Résume en 1 phrase.
+2) Propose 1 à 2 labels parmi: [Factures, Bancaire, Santé, Travail, École, RH, Rendez-vous, Technique, Newsletter, Promotions, Réseaux sociaux, Voyage, Livraison, Garanties, Notifications, Perso].
+3) Indique si action nécessaire (oui/non) avec une action courte.
 
-Réponds en JSON avec les clés: summary, labels, action_needed (bool), action (string).
+Réponds strictement en JSON: {"summary": "...", "labels": ["..."], "action_needed": true/false, "action": "..."}
 """
 
-def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=False):
+def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=False,
+                    clip=4000, num_predict=128, num_ctx=2048, temp=0.2, out_jsonl=None):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     rows = cur.execute("""
@@ -285,22 +281,29 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
     total_to_do = len(rows)
     print(f"To summarize: {total_to_do} emails")
 
-    # Warm-up: force model load once
+    # Warm-up
     try:
-        _ = run_ollama(model, "Réponds simplement: OK", options={"temperature": 0})
+        _ = run_ollama(model, "Réponds: OK", options={"temperature": 0, "num_ctx": 512, "num_predict": 4})
     except Exception as e:
         print(f"[WARN] warm-up failed: {e}")
+
+    # Prepare JSONL if requested
+    jsonl = open(out_jsonl, "a", encoding="utf-8") if out_jsonl else None
 
     updated = 0
     start_time = time.time()
 
     for idx, (_id, body, from_addr, subject) in enumerate(rows, 1):
-        print(f"\n[{idx}/{total_to_do}] Traitement mail ID={_id} | From: {from_addr} | Sujet: {subject[:60]!r}")
-        body_clip = body[:4000]  # keep prompt small
-        prompt = SUMMARY_PROMPT.format(body=body_clip)
+        print(f"\n[{idx}/{total_to_do}] ID={_id} | From: {from_addr} | Sujet: {subject[:60]!r}")
+        body_clip = (body or "")[:clip]
+        # use replace to inject body without invoking str.format (avoids needing to escape braces)
+        prompt = SUMMARY_PROMPT.replace("{body}", body_clip)
         try:
-            resp = run_ollama(model, prompt, options={"temperature": 0.2})
-            # try parse JSON, fallback to raw
+            resp = run_ollama(
+                model, prompt,
+                options={"temperature": float(temp), "num_ctx": int(num_ctx), "num_predict": int(num_predict)}
+            )
+            # parse JSON
             parsed = None
             try:
                 parsed = json.loads(resp)
@@ -324,6 +327,18 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
             print(f"  ➜ Labels: {labels_str}")
             print(f"  ➜ Résumé: {summary[:80]}...")
 
+            if jsonl:
+                rec = {
+                    "id": _id,
+                    "from": from_addr,
+                    "subject": subject,
+                    "summary": summary,
+                    "labels": labels,
+                    "ts": int(time.time())
+                }
+                jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                jsonl.flush()
+
             if not dry:
                 cur.execute("UPDATE emails SET summary=?, auto_labels=? WHERE id=?", (summary, labels_str, _id))
                 updated += 1
@@ -332,19 +347,19 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
                     elapsed = time.time() - start_time
                     avg_per = max(elapsed / updated, 1e-6)
                     remaining = (total_to_do - idx) * avg_per
-                    print(f"  ➜ Progression: {updated}/{total_to_do} | Temps estimé restant: {remaining/60:.1f} min")
+                    print(f"  ➜ Progression: {updated}/{total_to_do} | ETA: {remaining/60:.1f} min")
 
         except Exception as e:
             print(f"[WARN] id={_id}: {e}")
 
     conn.commit()
     conn.close()
+    if jsonl:
+        jsonl.close()
     print(f"\nDone. Updated {updated} emails.")
 
-# ----------------- CLI -----------------
-
 def main():
-    ap = argparse.ArgumentParser(description="Local Email AI Toolkit (verbose patched)")
+    ap = argparse.ArgumentParser(description="Local Email AI Toolkit (verbose + tunable)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_ing = sub.add_parser("ingest", help="Ingest MBOX into SQLite")
@@ -372,6 +387,11 @@ def main():
     p_sum.add_argument("--limit", type=int, default=200)
     p_sum.add_argument("--min-chars", type=int, default=200)
     p_sum.add_argument("--dry", action="store_true")
+    p_sum.add_argument("--clip", type=int, default=4000, help="Max chars of email body to send to LLM")
+    p_sum.add_argument("--num-predict", type=int, default=128, help="Max tokens to generate")
+    p_sum.add_argument("--num-ctx", type=int, default=2048, help="Context window")
+    p_sum.add_argument("--temp", type=float, default=0.2, help="Temperature")
+    p_sum.add_argument("--out-jsonl", type=str, default=None, help="Write per-mail JSON lines to this file")
 
     args = ap.parse_args()
 
@@ -386,7 +406,18 @@ def main():
     elif args.cmd == "export":
         export_csv(args.db, args.out)
     elif args.cmd == "summarize":
-        summarize_batch(args.db, model=args.model, limit=args.limit, min_chars=args.min_chars, dry=args.dry)
+        summarize_batch(
+            args.db,
+            model=args.model,
+            limit=args.limit,
+            min_chars=args.min_chars,
+            dry=args.dry,
+            clip=args.clip,
+            num_predict=args.num_predict,
+            num_ctx=args.num_ctx,
+            temp=args.temp,
+            out_jsonl=args.out_jsonl
+        )
 
 if __name__ == "__main__":
     main()

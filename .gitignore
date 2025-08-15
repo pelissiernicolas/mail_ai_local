@@ -20,6 +20,10 @@ All-mail*.mbox
 mails.csv
 *.csv
 
+# Logs
+*.log
+*.jsonl
+
 # OS
 .DS_Store
 Thumbs.db
