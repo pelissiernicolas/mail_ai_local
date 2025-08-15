@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-mail_ai_local_verbose2.py — Local email analysis toolkit (privacy-first)
+mail_ai_local_count.py — Local email analysis toolkit (privacy-first)
 
-Adds:
-- Verbose progress + ETA
-- Safer parsing (get_content_disposition)
-- Idempotent ingest (UNIQUE msg_id + INSERT OR IGNORE)
-- Deprecation fix for utcfromtimestamp
-- Ollama client with retries + warm-up
-- Tunables for speed/quality: --clip, --num-predict, --num-ctx, --temp
-- Optional per-mail output file: --out-jsonl (JSON Lines)
+Features:
+- Ingest Gmail Takeout MBOX into SQLite (idempotent)
+- Stats, top-senders, timeline
+- Export CSV (and Excel-friendly CSV with BOM)
+- Summarize + auto-label via Ollama (local) with tunables (+ verbose logs)
+- NEW: `count` subcommand to count summarized / labeled / total / attachments / unprocessed
+
+Usage examples:
+    python mail_ai_local_count.py ingest --mbox "All mail Including Spam and Trash.mbox" --db mail.db
+    python mail_ai_local_count.py stats --db mail.db
+    python mail_ai_local_count.py export --db mail.db --out mails.csv
+    python mail_ai_local_count.py export-excel --db mail.db --out mails_utf8.csv
+    python mail_ai_local_count.py count --db mail.db --what summarized
+    python mail_ai_local_count.py summarize --db mail.db --model mistral --limit 50 --clip 1200 --num-predict 80 --num-ctx 1536 --temp 0.1 --out-jsonl summaries.jsonl
 """
 
 import argparse
@@ -26,6 +32,8 @@ import csv
 import time
 from pathlib import Path
 
+# ------------- helpers -------------
+
 def safe_decode(value):
     if value is None:
         return ""
@@ -40,7 +48,14 @@ def safe_decode(value):
         except Exception:
             return str(value)
 
+def _strip_html(html: str) -> str:
+    # remove <script>...</script> and <style>...</style> blocks first
+    html = re.sub(r'(?is)<(script|style)[^>]*>.*?</\1>', ' ', html or '')
+    # then strip remaining tags
+    return re.sub(r'<[^>]+>', ' ', html)
+
 def extract_text_from_message(msg):
+    """Return plain text content; prefer text/plain, fallback to stripped text/html."""
     if msg.is_multipart():
         parts = []
         for part in msg.walk():
@@ -57,6 +72,7 @@ def extract_text_from_message(msg):
                 parts.append(text)
         if parts:
             return "\n".join(parts)
+        # Fallback: use the first HTML part
         for part in msg.walk():
             if part.get_content_type() == 'text/html':
                 payload = part.get_payload(decode=True)
@@ -66,7 +82,7 @@ def extract_text_from_message(msg):
                     html = payload.decode(part.get_content_charset() or 'utf-8', errors='replace')
                 except Exception:
                     html = payload.decode('utf-8', errors='replace')
-                return re.sub(r'<[^>]+>', ' ', html)
+                return _strip_html(html)
         return ""
     else:
         ctype = msg.get_content_type()
@@ -78,7 +94,7 @@ def extract_text_from_message(msg):
         except Exception:
             text = payload.decode('utf-8', errors='replace')
         if ctype == 'text/html':
-            text = re.sub(r'<[^>]+>', ' ', text)
+            text = _strip_html(text)
         return text
 
 def has_attachments(msg):
@@ -210,7 +226,7 @@ def timeline(db_path, by="month"):
         print(f"{k}\t{c}")
     conn.close()
 
-def export_csv(db_path, out_path):
+def export_csv(db_path, out_path, encoding='utf-8'):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     rows = cur.execute("""
@@ -218,23 +234,29 @@ def export_csv(db_path, out_path):
         FROM emails
         ORDER BY ts DESC
     """)
-    with open(out_path, 'w', newline='', encoding='utf-8') as f:
+    with open(out_path, 'w', newline='', encoding=encoding) as f:
         w = csv.writer(f)
         w.writerow(["date","from","to","subject","size_bytes","has_attachments","summary","auto_labels"])
         for row in rows:
             w.writerow(row)
     conn.close()
-    print(f"Exported to {out_path}")
+    print(f"Exported to {out_path} (encoding={encoding})")
 
-# ---------- Ollama client (tunable) ----------
+def export_csv_bom(db_path, out_path):
+    # Excel-friendly (UTF-8 with BOM)
+    export_csv(db_path, out_path, encoding='utf-8-sig')
+
+# --------- Ollama client ---------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
-def run_ollama(model, prompt, options=None, timeout=600):
+def run_ollama(model, prompt, options=None, timeout=600, force_json=True):
+    """Call Ollama with retries and larger timeout. If force_json=True, request JSON format."""
     payload = {"model": model, "prompt": prompt, "stream": False}
     if options:
         payload["options"] = options
-
+    if force_json:
+        payload["format"] = "json"
     tries = 3
     delay = 5
     last_exc = None
@@ -260,13 +282,13 @@ Voici l'e-mail (texte brut):
 Objectif:
 1) Résume en 1 phrase.
 2) Propose 1 à 2 labels parmi: [Factures, Bancaire, Santé, Travail, École, RH, Rendez-vous, Technique, Newsletter, Promotions, Réseaux sociaux, Voyage, Livraison, Garanties, Notifications, Perso].
-3) Indique si action nécessaire (oui/non) avec une action courte.
+3) Indique si action nécessaire (oui/non) et une action courte.
 
 Réponds strictement en JSON: {"summary": "...", "labels": ["..."], "action_needed": true/false, "action": "..."}
 """
 
 def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=False,
-                    clip=4000, num_predict=128, num_ctx=2048, temp=0.2, out_jsonl=None):
+                    clip=4000, num_predict=128, num_ctx=2048, temp=0.2, out_jsonl=None, verbose=True):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     rows = cur.execute("""
@@ -294,16 +316,18 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
     start_time = time.time()
 
     for idx, (_id, body, from_addr, subject) in enumerate(rows, 1):
-        print(f"\n[{idx}/{total_to_do}] ID={_id} | From: {from_addr} | Sujet: {subject[:60]!r}")
+        if verbose:
+            print(f"\n[{idx}/{total_to_do}] ID={_id} | From: {from_addr} | Sujet: {subject[:60]!r}")
         body_clip = (body or "")[:clip]
-        # use replace to inject body without invoking str.format (avoids needing to escape braces)
+        # avoid .format() to prevent JSON braces issues
         prompt = SUMMARY_PROMPT.replace("{body}", body_clip)
+
         try:
             resp = run_ollama(
                 model, prompt,
                 options={"temperature": float(temp), "num_ctx": int(num_ctx), "num_predict": int(num_predict)}
             )
-            # parse JSON
+            # try parse JSON, fallback to best-effort extraction
             parsed = None
             try:
                 parsed = json.loads(resp)
@@ -324,8 +348,9 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
             else:
                 labels_str = str(labels)[:200]
 
-            print(f"  ➜ Labels: {labels_str}")
-            print(f"  ➜ Résumé: {summary[:80]}...")
+            if verbose:
+                print(f"  ➜ Labels: {labels_str}")
+                print(f"  ➜ Résumé: {summary[:80]}...")
 
             if jsonl:
                 rec = {
@@ -347,7 +372,8 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
                     elapsed = time.time() - start_time
                     avg_per = max(elapsed / updated, 1e-6)
                     remaining = (total_to_do - idx) * avg_per
-                    print(f"  ➜ Progression: {updated}/{total_to_do} | ETA: {remaining/60:.1f} min")
+                    if verbose:
+                        print(f"  ➜ Progression: {updated}/{total_to_do} | ETA: {remaining/60:.1f} min")
 
         except Exception as e:
             print(f"[WARN] id={_id}: {e}")
@@ -358,8 +384,31 @@ def summarize_batch(db_path, model="mistral", limit=200, min_chars=200, dry=Fals
         jsonl.close()
     print(f"\nDone. Updated {updated} emails.")
 
+# ------------- count helpers -------------
+
+def count_items(db_path, what: str):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    if what == "summarized":
+        res = cur.execute("SELECT COUNT(*) FROM emails WHERE summary IS NOT NULL AND summary<>''").fetchone()[0]
+    elif what == "labeled":
+        res = cur.execute("SELECT COUNT(*) FROM emails WHERE auto_labels IS NOT NULL AND auto_labels<>''").fetchone()[0]
+    elif what == "total":
+        res = cur.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+    elif what == "attachments":
+        res = cur.execute("SELECT COUNT(*) FROM emails WHERE has_attachments=1").fetchone()[0]
+    elif what == "unprocessed":
+        res = cur.execute("SELECT COUNT(*) FROM emails WHERE (summary IS NULL OR summary='')").fetchone()[0]
+    else:
+        conn.close()
+        raise SystemExit(f"Unknown count '{what}'. Use summarized|labeled|total|attachments|unprocessed")
+    conn.close()
+    print(res)
+
+# ------------- CLI -------------
+
 def main():
-    ap = argparse.ArgumentParser(description="Local Email AI Toolkit (verbose + tunable)")
+    ap = argparse.ArgumentParser(description="Local Email AI Toolkit (with count & Excel export)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_ing = sub.add_parser("ingest", help="Ingest MBOX into SQLite")
@@ -377,9 +426,13 @@ def main():
     p_tl.add_argument("--db", required=True)
     p_tl.add_argument("--by", choices=["month","year"], default="month")
 
-    p_exp = sub.add_parser("export", help="Export CSV")
+    p_exp = sub.add_parser("export", help="Export CSV (UTF-8)")
     p_exp.add_argument("--db", required=True)
     p_exp.add_argument("--out", required=True)
+
+    p_expx = sub.add_parser("export-excel", help="Export CSV (UTF-8 BOM, Excel-friendly)")
+    p_expx.add_argument("--db", required=True)
+    p_expx.add_argument("--out", required=True)
 
     p_sum = sub.add_parser("summarize", help="Summarize + auto-label via Ollama")
     p_sum.add_argument("--db", required=True)
@@ -392,6 +445,11 @@ def main():
     p_sum.add_argument("--num-ctx", type=int, default=2048, help="Context window")
     p_sum.add_argument("--temp", type=float, default=0.2, help="Temperature")
     p_sum.add_argument("--out-jsonl", type=str, default=None, help="Write per-mail JSON lines to this file")
+    p_sum.add_argument("--quiet", action="store_true", help="Less verbose logs")
+
+    p_cnt = sub.add_parser("count", help="Count items in DB")
+    p_cnt.add_argument("--db", required=True)
+    p_cnt.add_argument("--what", required=True, choices=["summarized","labeled","total","attachments","unprocessed"])
 
     args = ap.parse_args()
 
@@ -405,6 +463,8 @@ def main():
         timeline(args.db, args.by)
     elif args.cmd == "export":
         export_csv(args.db, args.out)
+    elif args.cmd == "export-excel":
+        export_csv_bom(args.db, args.out)
     elif args.cmd == "summarize":
         summarize_batch(
             args.db,
@@ -416,8 +476,11 @@ def main():
             num_predict=args.num_predict,
             num_ctx=args.num_ctx,
             temp=args.temp,
-            out_jsonl=args.out_jsonl
+            out_jsonl=args.out_jsonl,
+            verbose=not args.quiet
         )
+    elif args.cmd == "count":
+        count_items(args.db, args.what)
 
 if __name__ == "__main__":
     main()
