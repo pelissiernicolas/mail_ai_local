@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Editor
+.vscode/
+.idea/
+
+# Data / DB / exports
+mail.db
+*.sqlite3
+All-mail*.mbox
+*.mbox
+mails.csv
+
+# OS
+.DS_Store
+Thumbs.db
