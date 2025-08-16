@@ -19,6 +19,7 @@ All-mail*.mbox
 *.mbox
 mails.csv
 *.csv
+decisions_preview.txt
 
 # Logs
 *.log
