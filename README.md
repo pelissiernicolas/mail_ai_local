@@ -27,60 +27,149 @@ python .\mail_ai_local.py summarize --db .\mail.db --model mistral \
 
 Ce kit te laisse **tout faire en local** : ingestion du fichier Gmail Takeout (`.mbox`), stats rapides et, si tu veux, **résumé + auto‑étiquetage** des mails via un LLM local (Ollama).
 
-## 0) Pré-requis
-- Python 3.9+
-- (Optionnel) [Ollama](https://ollama.com/) installé et lancé (`ollama serve`) avec un modèle local :  
-  `ollama pull mistral`  ou  `ollama pull llama3.1`
+# IA Gmail — Outils locaux
 
-## 1) Récupère tes mails
-- Va sur Google Takeout → n’exporte que **Gmail** → format **MBOX**.
-- Télécharge l’archive, décompresse-la. Le fichier MBOX ressemble à :  
-  `Takeout/Mail/All mail Including Spam and Trash.mbox`
+Un ensemble de scripts Python pour analyser, classer et nettoyer une boîte Gmail localement.
 
-## 2) Crée un venv & installe les libs
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install requests
+Principaux scripts
+------------------
+- `mail_ai_local.py`: ingestion MBOX -> SQLite, résumé automatique et extraction d'étiquettes via LLM.
+- `ai_decider.py`: appelle l'IA pour décider `keep|archive|delete`, stocke la décision dans `mail.db` et fournit des règles d'override utilisateur.
+- `apply_gmail_labels.py`: synchronise les décisions/étiquettes sur Gmail (DRY-RUN par défaut).
+- `delete_ai.py`: supprime en masse les messages marqués `_AI_DELETE` (ATTENTION: irréversible).
+- `decide_cleanup.py`: utilitaire de prévisualisation et règles manuelles.
+
+Prérequis
+---------
+- Python 3.10+ (venv recommandé).
+- `credentials.json` (OAuth Desktop) dans le dossier pour l'accès Gmail.
+- Un LLM local (ex: Ollama) pour utiliser les fonctions de résumé (optionnel).
+
+Installation rapide (Windows PowerShell)
+--------------------------------------
+```
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-## 3) Ingestion dans SQLite
-```bash
-python mail_ai_local.py ingest --mbox "All-maol.mbox" --db ./mail.db
+Configuration Gmail
+-------------------
+1. Créez un projet Google Cloud, activez l'API Gmail et créez des identifiants OAuth (type "Desktop").
+2. Placez `credentials.json` dans ce dossier.
+3. Au premier run un navigateur s'ouvrira pour autoriser l'accès; `token.json` sera créé.
+
+Usage courant
+-------------
+- Ingestion MBOX -> DB:
+```
+python mail_ai_local.py ingest --mbox All-mail.mbox --db .\mail.db
+```
+- Synthèse / génération d'étiquettes (dry-run recommandé):
+```
+python mail_ai_local.py summarize --db .\mail.db --limit 200 --dry
+```
+- Décisions IA (keep/archive/delete):
+```
+python ai_decider.py decide --db .\mail.db --model mistral --limit 500 --num-predict 160 --temp 0.1
+```
+- Appliquer labels sur Gmail (DRY-RUN par défaut):
+```
+python apply_gmail_labels.py --db .\mail.db --limit 200 --log-csv actions.csv --verbose
+```
+Ajoutez `--no-dry-run` pour exécuter réellement les actions.
+
+- Supprimer les messages marqués `_AI_DELETE` (ATTENTION):
+```
+del .\token.json  # forcer nouvelle authent
+python delete_ai.py
 ```
 
-## 4) Stats utiles
-```bash
-python mail_ai_local.py stats --db ./mail.db
-python mail_ai_local.py top-senders --db ./mail.db --limit 30
-python mail_ai_local.py timeline --db ./mail.db --by month   # ou --by year
-python mail_ai_local.py export --db ./mail.db --out mails.csv
+Bonnes pratiques & précautions
+------------------------------
+- Testez d'abord en dry-run et/ou sur un compte test.
+- `delete_ai.py` supprime définitivement — utilisez-le avec extrême prudence.
+- Si vous obtenez `Insufficient Permission`, supprimez `token.json` et relancez pour forcer la ré-authentification avec les scopes requis.
+
+Dépannage rapide
+----------------
+- `ModuleNotFoundError: No module named 'google'`: activez le venv et installez `pip install -r requirements.txt`.
+- JSON tronqué depuis le LLM: le code inclut des fonctions de "salvage" pour récupérer partiellement le JSON.
+
+Contribuer
+----------
+PRs bienvenus. Commencez par des changements petits et testables (p. ex. tests unitaires pour helpers).
+
+Licence
+-------
+MIT
+
+## Commandes utiles (copier/coller)
+
+Quelques commandes prêtes à l'emploi pour les opérations courantes (PowerShell).
+
+- Créer et activer l'environnement virtuel :
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-## 5) Résumé + labels (LLM local via Ollama)
-- Lance Ollama et récupère un modèle :
-```bash
-ollama serve &
-ollama pull mistral   # ou llama3.1 / qwen2.5
+- Ingest (mbox -> sqlite) :
+
+```powershell
+python .\mail_ai_local.py ingest --mbox All-mail.mbox --db .\mail.db
 ```
-- Puis :
-```bash
-python mail_ai_local.py summarize --db ./mail.db --model mistral --limit 200
+
+- Résumer / générer étiquettes (dry-run) :
+
+```powershell
+python .\mail_ai_local.py summarize --db .\mail.db --limit 200 --dry
 ```
-Le script :
-- Résume chaque mail en 1–2 phrases
-- Propose 1–3 labels (ex: Factures, Bancaire, Santé, Travail, Newsletter, Promotions, etc.)
-- Enregistre dans SQLite (`summary`, `auto_labels`)
 
-Tu peux relancer autant de fois que tu veux (il ne retraitera que ceux sans résumé).
+- Lancer l'IA pour décisions (exemple) :
 
-## 6) Exploiter les résultats
-- Ouvre `mails.csv` dans Excel/LibreOffice pour filtrer par `auto_labels` ou `size_bytes`.
-- Ou branche un outil BI (Metabase, Datasette) sur `mail.db`.
+```powershell
+python .\ai_decider.py decide --db .\mail.db --model mistral --limit 500 --num-predict 160 --temp 0.1
+```
 
-## 7) Idées d’amélioration
-- Ajouter un tableau de bord `streamlit` (graphiques, filtres).
-- Embeddings locaux + recherche sémantique (FAISS/Chroma).
-- Export automatique de **filtres Gmail** en XML à partir des labels proposés.
+- Appliquer labels sur Gmail (dry-run, journal CSV) :
 
-> Tout est **local** : ni contenu, ni métadonnées ne quittent ta machine.
+```powershell
+python .\apply_gmail_labels.py --db .\mail.db --limit 200 --log-csv actions.csv --verbose
+```
+
+- Appliquer labels réellement (supprime le mode dry-run) :
+
+```powershell
+python .\apply_gmail_labels.py --db .\mail.db --limit 200 --log-csv actions.csv --verbose --no-dry-run
+```
+
+- Rejouer les overrides utilisateur sur la DB :
+
+```powershell
+python .\ai_decider.py overrides --db .\mail.db
+```
+
+- Export CSV des décisions AI :
+
+```powershell
+python .\ai_decider.py export --db .\mail.db --out .\decisions_ai.csv
+```
+
+- Supprimer définitivement les messages marqués `_AI_DELETE` (vérifier token & scopes):
+
+```powershell
+del .\token.json  # si nécessaire pour forcer ré-auth
+python .\delete_ai.py
+```
+
+- Commande d'inspection rapide (compter résumés/étiquetés) :
+
+```powershell
+python .\mail_ai_local.py count --db .\mail.db --what summarized
+python .\mail_ai_local.py count --db .\mail.db --what labeled
+```
+
+Gardez ces commandes comme référence. Faites d'abord des dry-runs et validez les résultats (CSV, logs) avant d'exécuter des opérations irréversibles.
