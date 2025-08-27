@@ -1,28 +1,3 @@
-## Utilisation
-
-Compteurs
-
-```powershell
-python .\mail_ai_local.py count --db .\mail.db --what summarized
-python .\mail_ai_local.py count --db .\mail.db --what labeled
-python .\mail_ai_local.py count --db .\mail.db --what total
-python .\mail_ai_local.py count --db .\mail.db --what attachments
-python .\mail_ai_local.py count --db .\mail.db --what unprocessed
-```
-
-Export CSV compatible Excel (UTF-8 BOM)
-
-```powershell
-python .\mail_ai_local.py export-excel --db .\mail.db --out .\mails_utf8.csv
-```
-
-Résumés rapides + fichier JSONL au fil de l’eau
-
-```powershell
-python .\mail_ai_local.py summarize --db .\mail.db --model mistral \
-  --limit 50 --clip 1200 --num-predict 80 --num-ctx 1536 --temp 0.1 \
-  --out-jsonl summaries.jsonl
-```
 # IA locale pour analyser tes mails (Gmail)
 
 Ce kit te laisse **tout faire en local** : ingestion du fichier Gmail Takeout (`.mbox`), stats rapides et, si tu veux, **résumé + auto‑étiquetage** des mails via un LLM local (Ollama).
@@ -103,6 +78,32 @@ PRs bienvenus. Commencez par des changements petits et testables (p. ex. tests u
 Licence
 -------
 MIT
+
+## Utilisation
+
+Compteurs
+
+```powershell
+python .\mail_ai_local.py count --db .\mail.db --what summarized
+python .\mail_ai_local.py count --db .\mail.db --what labeled
+python .\mail_ai_local.py count --db .\mail.db --what total
+python .\mail_ai_local.py count --db .\mail.db --what attachments
+python .\mail_ai_local.py count --db .\mail.db --what unprocessed
+```
+
+Export CSV compatible Excel (UTF-8 BOM)
+
+```powershell
+python .\mail_ai_local.py export-excel --db .\mail.db --out .\mails_utf8.csv
+```
+
+Résumés rapides + fichier JSONL au fil de l’eau
+
+```powershell
+python .\mail_ai_local.py summarize --db .\mail.db --model mistral \
+  --limit 50 --clip 1200 --num-predict 80 --num-ctx 1536 --temp 0.1 \
+  --out-jsonl summaries.jsonl
+```
 
 ## Commandes utiles (copier/coller)
 
