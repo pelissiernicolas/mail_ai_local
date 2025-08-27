@@ -350,7 +350,7 @@ def timeline(db_path, by="month"):
         print(f"{k}\t{c}")
     conn.close()
 
-def export_csv(db_path, out_path, encoding='utf-8'):
+def export_csv(db_path, out_path, encoding='utf-8-sig'):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     rows = cur.execute("""

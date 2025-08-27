@@ -12,7 +12,7 @@ TODAY = datetime.datetime.utcnow().date()
 
 # règles simples (tu peux ajuster)
 KEEP_LABELS = {"Bancaire","Factures","Santé","Travail","École","RH","Livraison","Garanties","Perso"}
-LOW_LABELS  = {"Promotions","Newsletter","Réseaux sociaux"}
+LOW_LABELS  = {"Promotions","Newsletter","Réseaux sociaux"}  # <- garde Réseaux sociaux comme “low"
 SECURE_WORDS = re.compile(r"(security|sécurit|2fa|connexion|code|alerte|verif|unusual|nouvel appareil)", re.I)
 
 # fenêtres de temps
@@ -41,6 +41,8 @@ def decide(row):
     age = (TODAY - date).days if date else 9999
     label_set = {x.strip() for x in (labels or "").split(",") if x.strip()}
     label_main = next(iter(label_set), "")
+    # normaliser casse/accents pour tests robustes
+    label_norm = {x.strip().lower() for x in (labels or "").split(",") if x.strip()}
 
     # 0) tout récent -> garder
     if age <= KEEP_RECENT_DAYS:
@@ -60,12 +62,9 @@ def decide(row):
     if label_set & KEEP_LABELS:
         return "keep", "keep_label", label_main
 
-    # 4) promos/newsletters -> vieux => supprimer, sinon archiver
-    if label_set & LOW_LABELS:
-        if age >= LOW_TTL_DAYS:
-            return "delete", f"low_label_age>={LOW_TTL_DAYS}", label_main
-        else:
-            return "archive", f"low_label_age<{LOW_TTL_DAYS}", label_main
+    # 4) promos/newsletters -> SUPPRIMER systématiquement (sans condition d'âge)
+    if {"promotions","newsletter"} & label_norm:
+        return "delete", "promo/newsletter", label_main
 
     # 5) par défaut : archiver si vieux, garder sinon
     if age >= 90:
@@ -85,7 +84,7 @@ def main():
 
     stats = {"keep":0,"archive":0,"delete":0}
     by_label = {}
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+    with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["id","msg_id","date","from","subject","label_main","action","reason"])
         for r in rows:
@@ -94,7 +93,7 @@ def main():
             by_label[label_main] = by_label.get(label_main,0)+1
             w.writerow([r[0], r[1], r[2], r[3], r[4], label_main, action, reason])
 
-    with open(OUT_PREVIEW, "w", encoding="utf-8") as f:
+    with open(OUT_PREVIEW, "w", encoding="utf-8-sig") as f:
         f.write("=== Totaux par action ===\n")
         for k,v in stats.items():
             f.write(f"{k}: {v}\n")

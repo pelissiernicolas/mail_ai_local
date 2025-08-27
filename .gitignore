@@ -20,6 +20,8 @@ All-mail*.mbox
 mails.csv
 *.csv
 decisions_preview.txt
+credentials.json
+token.json
 
 # Logs
 *.log
